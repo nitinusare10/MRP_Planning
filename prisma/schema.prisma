@@ -1,0 +1,836 @@
+// Dopar MRP — Prisma schema
+// Source of truth: docs/architecture.md (approved architecture & schema).
+//
+// Conventions:
+// - All primary keys are DB-generated UUIDs (Postgres gen_random_uuid(), native since PG13).
+// - MRP-owned tables carry createdAt/updatedAt. Zoho-cache tables carry lastSyncedAt instead.
+// - Quantities use Decimal(18,6); prices/rates use Decimal(14,4); percentages use Decimal(5,4).
+// - Constraints Prisma cannot express (CHECK, partial unique indexes, EXCLUDE, immutability
+//   triggers, the circular-BOM guard) are added by hand in the initial migration SQL — see
+//   prisma/migrations/<ts>_init/migration.sql and docs/architecture.md "Database Enforcement" section.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  PLANNER
+  PROCUREMENT
+  VIEWER
+}
+
+enum ItemUomType {
+  DISCRETE
+  CONTINUOUS
+}
+
+enum MrpPlanningStatus {
+  PLANNED
+  NOT_PLANNED
+  INACTIVE
+}
+
+enum ItemClassification {
+  RAW_MATERIAL
+  PURCHASED_COMPONENT
+  SUB_ASSEMBLY
+  FINISHED_GOOD
+}
+
+enum PlanningMethod {
+  MRP
+  REORDER_POINT
+  NOT_PLANNED
+}
+
+enum MakeOrBuy {
+  MAKE
+  BUY
+}
+
+enum Criticality {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum BomStatus {
+  DRAFT
+  UNDER_REVIEW
+  APPROVED
+  OBSOLETE
+}
+
+enum DemandSourceType {
+  PRODUCTION_PLAN
+  SALES_ORDER
+  MANUAL
+  FORECAST
+}
+
+enum DemandStatus {
+  ACTIVE
+  CANCELLED
+}
+
+enum ProductionPlanStatus {
+  DRAFT
+  APPROVED
+  CLOSED
+}
+
+enum SyncEntityType {
+  ITEM
+  VENDOR
+  WAREHOUSE
+  STOCK
+  PURCHASE_ORDER
+  SALES_ORDER
+  PURCHASE_RECEIPT
+}
+
+enum SyncRunStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL_SUCCESS
+  FAILED
+}
+
+enum SyncTrigger {
+  SCHEDULED
+  MANUAL
+}
+
+enum ZohoConnectionStatus {
+  CONNECTED
+  EXPIRED
+  REVOKED
+}
+
+enum MrpRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum MrpTimeBucket {
+  DAILY
+  WEEKLY
+}
+
+enum PurchaseRecommendationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CONVERTED
+}
+
+enum PurchaseRequisitionStatus {
+  DRAFT
+  APPROVED
+  SENT_TO_ZOHO
+  CONVERTED
+  CANCELLED
+}
+
+enum MrpExceptionType {
+  CRITICAL_SHORTAGE
+  MATERIAL_SHORTAGE
+  MISSING_BOM
+  NO_APPROVED_BOM
+  MISSING_PLANNING_PARAMETERS
+  NO_APPROVED_VENDOR
+  PO_OVERDUE
+  INCOMING_PO_AFTER_REQUIRED_DATE
+  BELOW_SAFETY_STOCK
+  EXCESS_INVENTORY
+  MOQ_INDUCED_EXCESS
+  LEAD_TIME_RISK
+}
+
+enum MrpExceptionSeverity {
+  CRITICAL
+  WARNING
+  INFO
+}
+
+enum MrpExceptionStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Identity & Access
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name         String
+  email        String   @unique
+  passwordHash String? // nullable: reserved for future SSO-only accounts (no local password)
+  role         Role
+  active       Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  plannerForItems           MrpParameter[]             @relation("MrpParameterPlannerOwner")
+  createdBoms               Bom[]                      @relation("BomCreatedBy")
+  approvedBoms              Bom[]                      @relation("BomApprovedBy")
+  obsoletedBoms              Bom[]                      @relation("BomObsoletedBy")
+  connectedZohoConnections  ZohoConnection[]           @relation("ZohoConnectionConnectedBy")
+  createdProductionPlans    ProductionPlan[]           @relation("ProductionPlanCreatedBy")
+  approvedProductionPlans   ProductionPlan[]           @relation("ProductionPlanApprovedBy")
+  createdDemands            Demand[]                   @relation("DemandCreatedBy")
+  triggeredMrpRuns          MrpRun[]                   @relation("MrpRunTriggeredBy")
+  reviewedPurchaseRecommendations PurchaseRecommendation[] @relation("PurchaseRecommendationReviewedBy")
+  createdPurchaseRequisitions  PurchaseRequisition[]   @relation("PurchaseRequisitionCreatedBy")
+  approvedPurchaseRequisitions PurchaseRequisition[]   @relation("PurchaseRequisitionApprovedBy")
+  resolvedMrpExceptions     MrpException[]             @relation("MrpExceptionResolvedBy")
+  updatedMrpSettings        MrpSettings[]              @relation("MrpSettingsUpdatedBy")
+  auditLogEntries           AuditLog[]                 @relation("AuditLogChangedBy")
+  triggeredSyncLogs         SyncLog[]                  @relation("SyncLogTriggeredBy")
+
+  @@index([role])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Master Data (MRP-owned, except where noted)
+// ─────────────────────────────────────────────────────────────────────────
+
+model Item {
+  id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoItemId         String             @unique
+  sku                String
+  itemName           String
+  description        String?            @db.Text
+  uom                String
+  uomType            ItemUomType
+  zohoItemType       String
+  zohoStatus         String
+  active             Boolean
+  mrpPlanningStatus  MrpPlanningStatus  @default(NOT_PLANNED)
+  itemClassification ItemClassification
+  lastSyncedAt       DateTime           @default(now())
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  mrpParameter              MrpParameter?
+  bomsAsParent              Bom[]                    @relation("BomParentItem")
+  bomComponents             BomComponent[]           @relation("BomComponentItem")
+  itemVendors               ItemVendor[]
+  stockSnapshots            StockSnapshot[]
+  purchaseOrderLines        PurchaseOrderLine[]
+  purchaseReceiptLines      PurchaseReceiptLine[]
+  salesOrderLines           SalesOrderLine[]
+  productionPlanLines       ProductionPlanLine[]
+  demands                   Demand[]
+  mrpResults                MrpResult[]
+  mrpExceptions             MrpException[]
+  purchaseRecommendations   PurchaseRecommendation[]
+  purchaseRequisitionLines  PurchaseRequisitionLine[]
+
+  @@index([sku])
+  @@index([itemClassification, mrpPlanningStatus])
+}
+
+model MrpParameter {
+  id                String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  itemId            String         @unique @db.Uuid
+  planningMethod    PlanningMethod
+  makeOrBuy         MakeOrBuy
+  leadTimeDays      Int
+  moq               Decimal        @default(0) @db.Decimal(18, 6)
+  orderMultiple     Decimal        @default(1) @db.Decimal(18, 6)
+  safetyStock       Decimal        @default(0) @db.Decimal(18, 6)
+  criticality       Criticality
+  preferredVendorId String?        @db.Uuid
+  effectiveFrom     DateTime?      @db.Date
+  effectiveTo       DateTime?      @db.Date
+  plannerOwnerId    String?        @db.Uuid
+  active            Boolean        @default(true)
+  notes             String?        @db.Text
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  item            Item    @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  preferredVendor Vendor? @relation("MrpParameterPreferredVendor", fields: [preferredVendorId], references: [id])
+  plannerOwner    User?   @relation("MrpParameterPlannerOwner", fields: [plannerOwnerId], references: [id])
+
+  @@index([makeOrBuy])
+  @@index([criticality])
+}
+
+model Vendor {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoVendorId  String   @unique
+  vendorName    String
+  email         String?
+  phone         String?
+  paymentTerms  String?
+  zohoStatus    String
+  lastSyncedAt  DateTime @default(now())
+
+  itemVendors              ItemVendor[]
+  mrpParametersPreferring  MrpParameter[]            @relation("MrpParameterPreferredVendor")
+  purchaseOrders           PurchaseOrder[]
+  purchaseReceipts         PurchaseReceipt[]
+  purchaseRecommendations  PurchaseRecommendation[]
+  purchaseRequisitions     PurchaseRequisition[]
+
+  @@index([vendorName])
+}
+
+model Warehouse {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoWarehouseId  String   @unique
+  warehouseName    String
+  isPrimary        Boolean  @default(false)
+  zohoStatus       String
+  usableForMrp     Boolean  @default(true)
+  notes            String?  @db.Text
+  lastSyncedAt     DateTime @default(now())
+
+  stockSnapshots StockSnapshot[]
+}
+
+model Bom {
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bomCode            String    @unique
+  parentItemId       String    @db.Uuid
+  revision           String
+  description        String?   @db.Text
+  status             BomStatus @default(DRAFT)
+  effectiveFrom      DateTime? @db.Date
+  effectiveTo        DateTime? @db.Date
+  isCurrentRevision  Boolean   @default(false)
+  createdById        String    @db.Uuid
+  approvedById       String?   @db.Uuid
+  approvedAt         DateTime?
+  obsoletedById      String?   @db.Uuid
+  obsoletedAt        DateTime?
+  revisionReason     String?   @db.Text
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  parentItem   Item           @relation("BomParentItem", fields: [parentItemId], references: [id], onDelete: Restrict)
+  createdBy    User           @relation("BomCreatedBy", fields: [createdById], references: [id])
+  approvedBy   User?          @relation("BomApprovedBy", fields: [approvedById], references: [id])
+  obsoletedBy  User?          @relation("BomObsoletedBy", fields: [obsoletedById], references: [id])
+  components   BomComponent[]
+  mrpResults   MrpResult[]
+
+  // NOTE: the following are added by hand in the initial migration SQL (not expressible in
+  // Prisma's schema DSL): a partial unique index enforcing one isCurrentRevision=true row per
+  // parentItemId, an EXCLUDE constraint preventing overlapping effective date ranges among
+  // APPROVED revisions of the same parent item, and BEFORE UPDATE/DELETE triggers enforcing
+  // approved-BOM immutability.
+  @@unique([parentItemId, revision])
+  @@index([parentItemId, status])
+}
+
+model BomComponent {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bomId               String   @db.Uuid
+  lineNumber          Int
+  componentItemId     String   @db.Uuid
+  quantityPer         Decimal  @db.Decimal(18, 6)
+  uom                 String
+  scrapPercentage     Decimal  @default(0) @db.Decimal(5, 4)
+  operationSequence   String?
+  referenceDesignator String?
+  active              Boolean  @default(true)
+  notes               String?  @db.Text
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  bom           Bom  @relation(fields: [bomId], references: [id], onDelete: Cascade)
+  componentItem Item @relation("BomComponentItem", fields: [componentItemId], references: [id], onDelete: Restrict)
+
+  // NOTE: CHECK (scrapPercentage >= 0 AND scrapPercentage < 1) and the circular-BOM guard
+  // trigger (BEFORE INSERT OR UPDATE) are added by hand in the initial migration SQL.
+  @@unique([bomId, lineNumber])
+  @@index([componentItemId])
+}
+
+model ItemVendor {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  itemId              String   @db.Uuid
+  vendorId            String   @db.Uuid
+  vendorItemCode      String?
+  vendorPrice         Decimal? @db.Decimal(14, 4)
+  currency            String?
+  vendorLeadTimeDays  Int?
+  vendorMoq           Decimal? @db.Decimal(18, 6)
+  vendorOrderMultiple Decimal? @db.Decimal(18, 6)
+  preferred           Boolean  @default(false)
+  active              Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  item   Item   @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+
+  // NOTE: a partial unique index on (itemId) WHERE preferred = true AND active = true is added
+  // by hand in the initial migration SQL to enforce a single active preferred vendor per item.
+  @@unique([itemId, vendorId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Zoho Sync Cache (Zoho is the source of truth; MRP workflows never write here
+// except the sync jobs themselves)
+// ─────────────────────────────────────────────────────────────────────────
+
+model StockSnapshot {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  itemId             String   @db.Uuid
+  warehouseId        String   @db.Uuid
+  quantityOnHand     Decimal  @db.Decimal(18, 6)
+  quantityAvailable  Decimal? @db.Decimal(18, 6)
+  quantityCommitted  Decimal? @db.Decimal(18, 6)
+  snapshotAt         DateTime @default(now())
+
+  item      Item      @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, warehouseId])
+}
+
+model PurchaseOrder {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoPoId   String   @unique
+  poNumber   String
+  vendorId   String   @db.Uuid
+  status     String
+  orderDate  DateTime @db.Date
+  currency   String?
+  lastSyncedAt DateTime @default(now())
+
+  vendor Vendor              @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  lines  PurchaseOrderLine[]
+
+  @@index([vendorId])
+}
+
+model PurchaseOrderLine {
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoPoLineId          String   @unique
+  purchaseOrderId       String   @db.Uuid
+  itemId                String   @db.Uuid
+  orderedQuantity       Decimal  @db.Decimal(18, 6)
+  receivedQuantity      Decimal  @default(0) @db.Decimal(18, 6)
+  pendingQuantity       Decimal  @db.Decimal(18, 6)
+  rate                  Decimal? @db.Decimal(14, 4)
+  expectedDeliveryDate  DateTime @db.Date
+  lineStatus            String
+  usableForMrp          Boolean
+  lastSyncedAt          DateTime @default(now())
+
+  purchaseOrder     PurchaseOrder        @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  item              Item                 @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  purchaseReceiptLines PurchaseReceiptLine[]
+
+  @@index([itemId, expectedDeliveryDate])
+  @@index([itemId, usableForMrp])
+}
+
+model PurchaseReceipt {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoReceiptId   String   @unique
+  receiptNumber   String
+  vendorId        String   @db.Uuid
+  receivedDate    DateTime @db.Date
+  status          String
+  lastSyncedAt    DateTime @default(now())
+
+  vendor Vendor                @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  lines  PurchaseReceiptLine[]
+}
+
+model PurchaseReceiptLine {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoReceiptLineId    String   @unique
+  purchaseReceiptId    String   @db.Uuid
+  purchaseOrderLineId  String?  @db.Uuid
+  itemId               String   @db.Uuid
+  quantityReceived     Decimal  @db.Decimal(18, 6)
+  lastSyncedAt         DateTime @default(now())
+
+  purchaseReceipt   PurchaseReceipt    @relation(fields: [purchaseReceiptId], references: [id], onDelete: Cascade)
+  purchaseOrderLine PurchaseOrderLine? @relation(fields: [purchaseOrderLineId], references: [id], onDelete: SetNull)
+  item              Item               @relation(fields: [itemId], references: [id], onDelete: Restrict)
+
+  @@index([purchaseOrderLineId])
+}
+
+model SalesOrder {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoSoId     String   @unique
+  soNumber     String
+  customerName String?
+  orderDate    DateTime @db.Date
+  status       String
+  lastSyncedAt DateTime @default(now())
+
+  lines SalesOrderLine[]
+}
+
+model SalesOrderLine {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoSoLineId           String    @unique
+  salesOrderId           String    @db.Uuid
+  itemId                 String    @db.Uuid
+  quantity               Decimal   @db.Decimal(18, 6)
+  shippedQuantity        Decimal   @default(0) @db.Decimal(18, 6)
+  expectedShipmentDate   DateTime? @db.Date
+  status                 String
+  lastSyncedAt           DateTime  @default(now())
+
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  item       Item       @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  demand     Demand?
+
+  @@index([itemId])
+}
+
+model SyncLog {
+  id                 String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  syncEntityType     SyncEntityType
+  runStartedAt       DateTime       @default(now())
+  runEndedAt         DateTime?
+  status             SyncRunStatus  @default(RUNNING)
+  recordsProcessed   Int?
+  recordsCreated     Int?
+  recordsUpdated     Int?
+  recordsFailed      Int?
+  errorDetails       String?        @db.Text
+  triggerType        SyncTrigger    @default(SCHEDULED)
+  triggeredByUserId  String?        @db.Uuid
+  lastPageCursor     String?
+
+  triggeredByUser User? @relation("SyncLogTriggeredBy", fields: [triggeredByUserId], references: [id])
+
+  @@index([syncEntityType, runStartedAt])
+}
+
+model ZohoConnection {
+  id                    String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zohoOrganizationId    String
+  accessTokenEncrypted  String               @db.Text
+  refreshTokenEncrypted String               @db.Text
+  tokenExpiresAt        DateTime
+  scope                 String?              @db.Text
+  apiDomain             String
+  connectedById         String               @db.Uuid
+  connectedAt           DateTime             @default(now())
+  lastRefreshedAt       DateTime?
+  status                ZohoConnectionStatus @default(CONNECTED)
+
+  connectedBy User @relation("ZohoConnectionConnectedBy", fields: [connectedById], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Planning & Demand (MRP-owned)
+// ─────────────────────────────────────────────────────────────────────────
+
+model ProductionPlan {
+  id                String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  planCode          String               @unique
+  planName          String
+  horizonStartDate  DateTime             @db.Date
+  horizonEndDate    DateTime             @db.Date
+  status            ProductionPlanStatus @default(DRAFT)
+  createdById       String               @db.Uuid
+  approvedById      String?              @db.Uuid
+  approvedAt        DateTime?
+  notes             String?              @db.Text
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  createdBy  User                 @relation("ProductionPlanCreatedBy", fields: [createdById], references: [id])
+  approvedBy User?                @relation("ProductionPlanApprovedBy", fields: [approvedById], references: [id])
+  lines      ProductionPlanLine[]
+}
+
+model ProductionPlanLine {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productionPlanId  String   @db.Uuid
+  itemId            String   @db.Uuid
+  quantity          Decimal  @db.Decimal(18, 6)
+  requiredDate      DateTime @db.Date
+  notes             String?  @db.Text
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  productionPlan ProductionPlan @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  item           Item           @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  demand         Demand?
+
+  @@index([itemId, requiredDate])
+}
+
+model Demand {
+  id                    String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  itemId                String           @db.Uuid
+  quantity              Decimal          @db.Decimal(18, 6)
+  requiredDate          DateTime         @db.Date
+  demandSourceType      DemandSourceType
+  productionPlanLineId  String?          @unique @db.Uuid
+  salesOrderLineId      String?          @unique @db.Uuid
+  status                DemandStatus     @default(ACTIVE)
+  createdById           String?          @db.Uuid
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  item               Item                @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  productionPlanLine ProductionPlanLine? @relation(fields: [productionPlanLineId], references: [id], onDelete: SetNull)
+  salesOrderLine     SalesOrderLine?     @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)
+  createdBy          User?               @relation("DemandCreatedBy", fields: [createdById], references: [id])
+  mrpResultLinks     MrpResultDemandLink[]
+
+  // NOTE: a CHECK constraint tying demandSourceType to exactly the matching source-reference
+  // column (and forbidding the other) is added by hand in the initial migration SQL.
+  @@index([itemId, requiredDate, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MRP Engine Output (immutable historical records — engine itself is Phase 5)
+// ─────────────────────────────────────────────────────────────────────────
+
+model MrpRun {
+  id                    String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  runNumber             String       @unique
+  runStartedAt          DateTime     @default(now())
+  runEndedAt            DateTime?
+  planningHorizonStart  DateTime     @db.Date
+  planningHorizonEnd    DateTime     @db.Date
+  timeBucket            MrpTimeBucket
+  triggeredById         String       @db.Uuid
+  status                MrpRunStatus @default(RUNNING)
+  engineVersion         String?
+  errorDetails          String?      @db.Text
+
+  triggeredBy User            @relation("MrpRunTriggeredBy", fields: [triggeredById], references: [id])
+  results     MrpResult[]
+  exceptions  MrpException[]
+
+  // NOTE: triggers preventing UPDATE or DELETE of a run once it is finalized
+  // (status COMPLETED/FAILED) are added by hand in the initial migration SQL.
+  // A still-RUNNING run may be freely updated/deleted (e.g. a crashed run).
+  @@index([status, runStartedAt])
+}
+
+model MrpResult {
+  id                              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mrpRunId                        String   @db.Uuid
+  itemId                          String   @db.Uuid
+  bomId                           String?  @db.Uuid
+  bomExplosionLevel               Int      @default(0)
+  theoreticalGrossRequirement     Decimal  @db.Decimal(18, 6)
+  scrapPercentageApplied          Decimal  @default(0) @db.Decimal(5, 4)
+  scrapAdjustedGrossRequirement   Decimal  @db.Decimal(18, 6)
+  safetyStockApplied              Decimal  @default(0) @db.Decimal(18, 6)
+  availableStockSnapshot          Decimal  @db.Decimal(18, 6)
+  usableIncomingSupplySnapshot    Decimal  @db.Decimal(18, 6)
+  netRequirement                  Decimal  @db.Decimal(18, 6)
+  moqApplied                      Decimal  @default(0) @db.Decimal(18, 6)
+  orderMultipleApplied            Decimal  @default(1) @db.Decimal(18, 6)
+  recommendedQuantity             Decimal  @db.Decimal(18, 6)
+  earliestRequiredDate            DateTime @db.Date
+  vendorLeadTimeDaysApplied       Int?
+  latestPoReleaseDate             DateTime? @db.Date
+  criticalitySnapshot             Criticality
+  shortageFlag                    Boolean  @default(false)
+  createdAt                       DateTime @default(now())
+
+  mrpRun               MrpRun                   @relation(fields: [mrpRunId], references: [id], onDelete: Cascade)
+  item                 Item                     @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  bom                  Bom?                     @relation(fields: [bomId], references: [id], onDelete: SetNull)
+  demandLinks          MrpResultDemandLink[]
+  periods              MrpResultPeriod[]
+  purchaseRecommendation PurchaseRecommendation?
+
+  // NOTE: BEFORE UPDATE/DELETE triggers making these rows fully append-only (immutable
+  // historical snapshots) are added by hand in the initial migration SQL.
+  @@unique([mrpRunId, itemId])
+  @@index([itemId, mrpRunId])
+  @@index([shortageFlag])
+}
+
+model MrpResultPeriod {
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mrpResultId           String   @db.Uuid
+  periodStartDate       DateTime @db.Date
+  grossRequirement      Decimal  @db.Decimal(18, 6)
+  scheduledReceipts     Decimal  @db.Decimal(18, 6)
+  projectedOnHand       Decimal  @db.Decimal(18, 6)
+  netRequirement        Decimal  @db.Decimal(18, 6)
+  plannedOrderReceipt   Decimal  @db.Decimal(18, 6)
+  plannedOrderRelease   Decimal  @db.Decimal(18, 6)
+
+  mrpResult MrpResult @relation(fields: [mrpResultId], references: [id], onDelete: Cascade)
+
+  // NOTE: immutability trigger added by hand in the initial migration SQL.
+  @@unique([mrpResultId, periodStartDate])
+}
+
+model MrpResultDemandLink {
+  id               String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mrpResultId      String  @db.Uuid
+  demandId         String  @db.Uuid
+  quantityApplied  Decimal @db.Decimal(18, 6)
+
+  mrpResult MrpResult @relation(fields: [mrpResultId], references: [id], onDelete: Cascade)
+  demand    Demand    @relation(fields: [demandId], references: [id], onDelete: Restrict)
+
+  // NOTE: immutability trigger added by hand in the initial migration SQL.
+  @@unique([mrpResultId, demandId])
+  @@index([demandId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Procurement Workflow (MRP-owned)
+// ─────────────────────────────────────────────────────────────────────────
+
+model PurchaseRecommendation {
+  id                  String                       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mrpResultId         String                       @unique @db.Uuid
+  itemId              String                       @db.Uuid
+  recommendedVendorId String?                      @db.Uuid
+  recommendedQuantity Decimal                      @db.Decimal(18, 6)
+  requiredDate        DateTime                     @db.Date
+  latestReleaseDate   DateTime?                    @db.Date
+  shortageQuantity    Decimal                      @db.Decimal(18, 6)
+  criticality         Criticality
+  status              PurchaseRecommendationStatus @default(PENDING)
+  reviewedById        String?                      @db.Uuid
+  reviewedAt          DateTime?
+  reviewNotes         String?                      @db.Text
+  createdAt           DateTime                     @default(now())
+  updatedAt           DateTime                     @updatedAt
+
+  mrpResult         MrpResult                  @relation(fields: [mrpResultId], references: [id], onDelete: Cascade)
+  item              Item                       @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  recommendedVendor Vendor?                    @relation(fields: [recommendedVendorId], references: [id])
+  reviewedBy        User?                      @relation("PurchaseRecommendationReviewedBy", fields: [reviewedById], references: [id])
+  requisitionLine   PurchaseRequisitionLine?
+
+  @@index([status, recommendedVendorId])
+}
+
+model PurchaseRequisition {
+  id                 String                    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  requisitionNumber  String                    @unique
+  vendorId           String                    @db.Uuid
+  status             PurchaseRequisitionStatus @default(DRAFT)
+  createdById        String                    @db.Uuid
+  approvedById       String?                   @db.Uuid
+  approvedAt         DateTime?
+  zohoPoId           String?
+  zohoPoNumber       String?
+  pushedAt           DateTime?
+  notes              String?                   @db.Text
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @updatedAt
+
+  vendor     Vendor                     @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  createdBy  User                       @relation("PurchaseRequisitionCreatedBy", fields: [createdById], references: [id])
+  approvedBy User?                      @relation("PurchaseRequisitionApprovedBy", fields: [approvedById], references: [id])
+  lines      PurchaseRequisitionLine[]
+
+  @@index([vendorId, status])
+}
+
+model PurchaseRequisitionLine {
+  id                        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  purchaseRequisitionId     String   @db.Uuid
+  purchaseRecommendationId  String?  @unique @db.Uuid
+  itemId                    String   @db.Uuid
+  quantity                  Decimal  @db.Decimal(18, 6)
+  unitPrice                 Decimal? @db.Decimal(14, 4)
+  requiredDate              DateTime @db.Date
+
+  purchaseRequisition    PurchaseRequisition     @relation(fields: [purchaseRequisitionId], references: [id], onDelete: Cascade)
+  purchaseRecommendation PurchaseRecommendation? @relation(fields: [purchaseRecommendationId], references: [id], onDelete: SetNull)
+  item                   Item                    @relation(fields: [itemId], references: [id], onDelete: Restrict)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MRP Exceptions (schema only — detection engine is a future phase)
+// ─────────────────────────────────────────────────────────────────────────
+
+model MrpException {
+  id                String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mrpRunId          String?               @db.Uuid
+  itemId            String                @db.Uuid
+  exceptionType     MrpExceptionType
+  severity          MrpExceptionSeverity
+  relatedEntityType String?
+  relatedEntityId   String?               @db.Uuid
+  details           String?               @db.Text
+  status            MrpExceptionStatus    @default(OPEN)
+  detectedAt        DateTime              @default(now())
+  resolvedAt        DateTime?
+  resolvedById      String?               @db.Uuid
+
+  mrpRun     MrpRun? @relation(fields: [mrpRunId], references: [id], onDelete: Cascade)
+  item       Item    @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  resolvedBy User?   @relation("MrpExceptionResolvedBy", fields: [resolvedById], references: [id])
+
+  @@index([itemId, status])
+  @@index([mrpRunId])
+  @@index([exceptionType, status])
+  @@index([relatedEntityType, relatedEntityId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// System
+// ─────────────────────────────────────────────────────────────────────────
+
+model MrpSettings {
+  id                          Int           @id @default(1)
+  defaultPlanningHorizonDays  Int           @default(90)
+  defaultTimeBucket           MrpTimeBucket @default(WEEKLY)
+  defaultCurrency             String        @default("INR")
+  workingDays                 Json          @default("[1,2,3,4,5,6]")
+  updatedById                 String?       @db.Uuid
+  updatedAt                   DateTime      @updatedAt
+
+  updatedBy User? @relation("MrpSettingsUpdatedBy", fields: [updatedById], references: [id])
+
+  // NOTE: CHECK (id = 1) added by hand in the initial migration SQL to enforce a single row.
+}
+
+model AuditLog {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entityType   String
+  entityId     String      @db.Uuid
+  action       AuditAction
+  fieldName    String?
+  oldValue     String?     @db.Text
+  newValue     String?     @db.Text
+  changedById  String?     @db.Uuid
+  changedAt    DateTime    @default(now())
+  reason       String?     @db.Text
+
+  changedBy User? @relation("AuditLogChangedBy", fields: [changedById], references: [id])
+
+  @@index([entityType, entityId, changedAt])
+}
