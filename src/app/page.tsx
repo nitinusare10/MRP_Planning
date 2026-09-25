@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { auth } from "@/auth";
 import { logout } from "./actions";
 
@@ -13,6 +14,9 @@ export default async function Home() {
         Signed in as <span className="font-medium">{session?.user.email}</span> (
         {session?.user.role})
       </p>
+      <Link href="/zoho" className="text-sm underline">
+        Zoho integration status
+      </Link>
       <form action={logout}>
         <button type="submit" className="text-sm underline">
           Sign out

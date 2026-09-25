@@ -1,10 +1,18 @@
 # Dopar MRP — Architecture & Database Schema
 
-Status: **approved**, Phase 0 (project foundation) implemented on top of it.
-This document is the source of truth for the system design; implementation
-follows it exactly unless a technical blocker forces a change, in which case
-the change is called out explicitly (see "Implementation notes" at the end
-of each relevant section, and "Phase 0 deviations" at the bottom).
+Status: **approved**, Phase 0 (project foundation) and Phase 1 (Zoho
+Inventory integration foundation) implemented on top of it. This document is
+the source of truth for the system design; implementation follows it exactly
+unless a technical blocker forces a change, in which case the change is
+called out explicitly (see "Implementation notes / deviations" near the
+bottom).
+
+Note on phase numbering: the phase list below is the one actually being
+executed against (confirmed across the Phase 0/1/2 kickoff messages) and
+supersedes any earlier draft numbering — in particular, Zoho OAuth
+connection and entity synchronization were combined into a single Phase 1
+("Zoho Inventory Integration Foundation") rather than split across two
+phases.
 
 ## 1. Objective and business principle
 
@@ -26,28 +34,30 @@ MRP-owned planning parameters are never overwritten by sync. This is a
 
 ## 2. Development phases
 
-| Phase | Scope                                                                                                                                    | Status      |
-| ----- | ---------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| 0     | Project foundation: Next.js, TypeScript, Postgres, Prisma, auth, RBAC, logging, error handling, testing, linting, folder structure, docs | **Done**    |
-| 1     | _(folded into Phase 0)_ Database schema                                                                                                  | **Done**    |
-| 2     | Zoho Inventory OAuth connection                                                                                                          | Not started |
-| 3     | Item/Vendor/Warehouse/Stock/PO/SO/Receipt synchronization                                                                                | Not started |
-| 4     | BOM management (revisions, approval workflow, explosion)                                                                                 | Not started |
-| 5     | Demand & production plan module                                                                                                          | Not started |
-| 6     | MRP calculation engine (time-phased)                                                                                                     | Not started |
-| 7     | Purchase recommendations & consolidation                                                                                                 | Not started |
-| 8     | Approval workflow                                                                                                                        | Not started |
-| 9     | Push approved purchases to Zoho as POs                                                                                                   | Not started |
-| 10    | Dashboards & exception reports                                                                                                           | Not started |
+| Phase | Scope                                                                                                                                                                                                                                  | Status      |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| 0     | Project foundation: Next.js, TypeScript, Postgres, Prisma, auth, RBAC, logging, error handling, testing, linting, folder structure, docs                                                                                               | **Done**    |
+| 1     | Zoho Inventory integration foundation: OAuth2 flow, encrypted token storage, API client (retry/backoff/rate-limit/pagination), sync jobs for Item/Vendor/Warehouse/Purchase Order/Purchase Receipt/Sales Order/Stock, minimal admin UI | **Done**    |
+| 2     | Master Data + BOM Management (Item/Vendor/Warehouse/MRP-parameter UI, full BOM lifecycle)                                                                                                                                              | Not started |
+| 3     | Demand & production plan module                                                                                                                                                                                                        | Not started |
+| 4     | MRP calculation engine (time-phased)                                                                                                                                                                                                   | Not started |
+| 5     | Purchase recommendations & consolidation                                                                                                                                                                                               | Not started |
+| 6     | Approval workflow                                                                                                                                                                                                                      | Not started |
+| 7     | Push approved purchases to Zoho as POs                                                                                                                                                                                                 | Not started |
+| 8     | Dashboards & exception reports                                                                                                                                                                                                         | Not started |
 
-Nothing beyond Phase 0 is implemented. No Zoho API calls, no BOM explosion,
-no MRP engine, no fake/demo data exist in this codebase.
+Phase 1 is built and fully tested against **mocked** Zoho responses — no
+real Zoho API app is registered yet, so the actual OAuth round-trip with
+Zoho is untested against the live API (see §9.7 "Connecting to a real
+Zoho org"). No BOM explosion, no MRP engine, no fake/demo data exist in
+this codebase.
 
 ## 3. System architecture
 
 ```
                     Zoho Inventory (source of truth for transactions)
-                                  |  REST API, OAuth2 (Phase 2+)
+                                  |  REST API, OAuth2 (Phase 1 — built, inert until
+                                  |  real ZOHO_CLIENT_ID/SECRET are configured)
                                   v
                  lib/zoho/  — OAuth token mgmt, paginated resumable sync jobs,
                               idempotent upsert by zohoXxxId, errors -> SyncLog
@@ -87,7 +97,7 @@ no MRP engine, no fake/demo data exist in this codebase.
   (E2E)
 - **Lint/format:** ESLint (`eslint-config-next` + `typescript`), Prettier
 - **Styling:** Tailwind CSS (scaffolded; no UI beyond the minimal
-  login/landing page exists yet — dashboards are Phase 10)
+  login/landing page exists yet — dashboards are Phase 8)
 
 ### Folder structure
 
@@ -95,19 +105,30 @@ no MRP engine, no fake/demo data exist in this codebase.
 prisma/                  schema.prisma, migrations/, seed.ts
 src/
   app/                   Next.js App Router pages, API routes
-  components/{ui,tables,forms,layout}/   (empty until Phase 10 UI work)
+    zoho/                Zoho integration status page + Server Actions
+    api/zoho/oauth/callback/   OAuth callback Route Handler (GET)
+  components/{ui,tables,forms,layout}/   (empty until Phase 8 UI work)
   lib/
     auth/                password hashing (bcryptjs), server-side RBAC
     db/                   Prisma client singleton (driver-adapter wired)
     errors/               AppError hierarchy + toApiError()
     logging/               pino logger
-    mrp/                   MRP engine — empty, Phase 6
+    mrp/                   MRP engine — empty, Phase 4
     validation/            Zod schemas
-    zoho/{sync/}            Zoho integration — empty, Phase 2/3
-  services/                business logic layer, one module per domain (empty so far)
+    zoho/                  Zoho integration — built, Phase 1
+      types.ts             shared types with zero server-only deps (Client-Component-safe)
+      errors.ts             ZohoApiError hierarchy + app-facing ZohoNotConnectedError etc.
+      redact.ts             secret redaction for logs/SyncLog.errorDetails
+      auth/                 encryption.ts, oauth.ts, state.ts, connection.ts
+      client/                zohoApiClient.ts (retry/backoff/rate-limit/timeout),
+                              pagination.ts, connectedClient.ts (DB-backed wiring)
+      mappers/               one file per entity: Zod schema + Zoho->Prisma mapping
+      sync/                  engine.ts (generic) + one syncX.ts per entity + index.ts
+  services/                zohoIntegrationService.ts (more to come per future phase)
   types/                   ambient type augmentations (next-auth module augmentation)
   auth.ts / auth.config.ts / proxy.ts   Auth.js config (split for Edge-runtime compatibility, see file comments)
-tests/{unit,integration,e2e}/
+tests/
+  unit/zoho/  integration/zoho/  e2e/
 docs/{architecture.md,decisions/}
 ```
 
@@ -147,23 +168,28 @@ internal detail leaked.
   not the redirect.
 - **Current UI:** `/login` (Credentials form via a Server Action) and a
   deliberately minimal authenticated landing page (`/`) that only proves
-  the pipeline works — not the Phase 10 dashboard.
+  the pipeline works — not the Phase 8 dashboard.
 
-### Zoho integration architecture (planned — Phase 2/3, not yet built)
+### Zoho integration architecture — implemented in Phase 1
 
 OAuth2 authorization-code flow. Client ID/secret in environment variables;
-per-connection access/refresh tokens stored **encrypted** in the
-`ZohoConnection` table (see schema below) — never in code, never sent to
-the browser. All Zoho HTTP calls happen only in server-side code under
+per-connection access/refresh tokens stored **encrypted** (AES-256-GCM) in
+the `ZohoConnection` table (see schema below) — never in code, never sent
+to the browser. All Zoho HTTP calls happen only in server-side code under
 `lib/zoho/`; the browser only ever sees sync status/results read back from
 Postgres. Sync jobs are paginated and resumable (cursor persisted in
 `SyncLog`), upsert by the Zoho-issued id (`zoho*Id` columns, each
-`@unique`), and are safe to re-run without creating duplicates.
+`@unique`), and are safe to re-run without creating duplicates. **See §9
+for the full detail**: OAuth flow, required scopes/redirect URI, the API
+client's retry/rate-limit/timeout behavior, entity mapping, idempotency,
+failure recovery, the security model, the mocked-testing approach, and the
+procedure for connecting a real Zoho account once credentials exist.
 
 ### Deployment architecture (planned)
 
 - **Hosting:** Vercel (native Next.js support, built-in Cron for scheduling
-  sync jobs once Phase 2 exists, preview deployments per branch).
+  the now-built sync jobs once a real Zoho connection exists, preview
+  deployments per branch).
 - **Database:** Neon (serverless Postgres) — chosen over Supabase because
   we don't need Supabase's bundled auth/storage (Auth.js + Prisma cover
   that already), and Neon's branching model fits a per-PR/per-stage testing
@@ -187,9 +213,14 @@ Postgres. Sync jobs are paginated and resumable (cursor persisted in
   already does), with full history in `AuditLog`. Revisit if a multi-stage/
   multi-approver chain becomes a real requirement.
 - Zoho data center (`.com` vs `.in`) and API version: **still needs
-  confirmation** before Phase 2.
+  confirmation** before a real Zoho app is registered and `ZOHO_DATA_CENTER`
+  is set (§9.2).
 - Data residency/compliance requirements: **still needs confirmation**
   before finalizing the deployment region.
+- A few Zoho line-item-level field names (delivery/shipment dates) could not
+  be verified against live docs in this environment (no credentials,
+  blocked egress) — implemented defensively with documented fallbacks; see
+  §8 (Phase 1 deviations) and §9.7.
 
 ## 4. Database schema
 
@@ -213,11 +244,11 @@ each table and the constraints layered on top of it.
   (`PLANNED`/`NOT_PLANNED`/`INACTIVE`) and `itemClassification`
   (`RAW_MATERIAL`/`PURCHASED_COMPONENT`/`SUB_ASSEMBLY`/`FINISHED_GOOD`).
   `uomType` (`DISCRETE`/`CONTINUOUS`) governs MOQ/order-multiple validation
-  (see MRP calculation method, §5) — never stores a stock quantity.
+  (see MRP calculation method, §6) — never stores a stock quantity.
 - **MrpParameter** — one row per item (`itemId` unique): `planningMethod`,
   `makeOrBuy`, `leadTimeDays`, `moq`, `orderMultiple`, `safetyStock`,
   `criticality`, `preferredVendorId`. **No scrap field here** — scrap lives
-  solely on `BomComponent` (§5 explains why splitting it across two places
+  solely on `BomComponent` (§6 explains why splitting it across two places
   was the ambiguity we removed).
 - **Vendor**, **Warehouse** — Zoho-owned mirrors.
   `Warehouse.usableForMrp` is the MRP-owned flag gating which warehouses'
@@ -228,7 +259,7 @@ each table and the constraints layered on top of it.
   audit fields. See §5 for the immutability/overlap/circularity
   enforcement.
 - **BomComponent** (lines) — `quantityPer`, `uom`, **`scrapPercentage`**
-  (the _only_ scrap factor in the system — see §5), `operationSequence`
+  (the _only_ scrap factor in the system — see §6), `operationSequence`
   (a plain text label, not a routing/capacity feature — explicitly out of
   scope), `referenceDesignator`.
 - **ItemVendor** — per-vendor sourcing terms (`vendorPrice`,
@@ -240,7 +271,7 @@ each table and the constraints layered on top of it.
 
 - **StockSnapshot** — latest-value upsert per `(itemId, warehouseId)`, not
   an append-only history; historical stock position at planning time is
-  preserved in `MrpResult` instead (§5).
+  preserved in `MrpResult` instead (see "MRP engine output" below).
 - **PurchaseOrder** / **PurchaseOrderLine** — `PurchaseOrderLine.pendingQuantity`
   is ordered minus received; **`usableForMrp`** is computed once, at sync
   time, from the Zoho status + `pendingQuantity > 0` (cancelled/closed/zero-
@@ -284,7 +315,7 @@ each table and the constraints layered on top of it.
 - **MrpResult** — one row per item per run, the actionable summary:
   `theoreticalGrossRequirement` (pre-scrap) → `scrapPercentageApplied` →
   `scrapAdjustedGrossRequirement` (the figure the net-requirement formula
-  actually uses — see §5), frozen `availableStockSnapshot` /
+  actually uses — see §6), frozen `availableStockSnapshot` /
   `usableIncomingSupplySnapshot` (so a stock change tomorrow never rewrites
   what the system knew at run time), `netRequirement`, `moqApplied` /
   `orderMultipleApplied`, `recommendedQuantity`, `bomId` (which exact
@@ -497,11 +528,13 @@ erDiagram
     PURCHASE_REQUISITION ||--o{ PURCHASE_REQUISITION_LINE : contains
 ```
 
-## 8. Phase 0 implementation notes / deviations
+## 8. Phase 0 / Phase 1 implementation notes / deviations
 
 Disclosed here per "never silently make major architectural decisions" —
 none of these change the approved architecture, they're implementation
 details encountered while building it:
+
+**Phase 0:**
 
 - **Prisma pinned to 7.10.0, not the npm `latest` tag.** At build time,
   `latest` pointed to an `8.0.0-rc` pre-release; pinned to the last stable
@@ -525,7 +558,216 @@ details encountered while building it:
   it's the standard path for Credentials auth on the App Router today, but
   flagging the version status for visibility.
 
-## 9. What's explicitly out of scope (for now)
+**Phase 1:**
+
+- **Client Component / server-only module boundary bug.** `sync-buttons.tsx`
+  (a Client Component) originally imported `ZOHO_SYNC_ENTITIES` from
+  `lib/zoho/sync/index.ts`, which transitively imports the Prisma client and
+  `pg` — that leaked server-only code into the browser bundle and broke the
+  production build (`Module not found: Can't resolve 'util/types'`). Fixed
+  by moving the dependency-free constant/type (`ZOHO_SYNC_ENTITIES` /
+  `ZohoSyncEntity`) into `lib/zoho/types.ts`, which has no server-only
+  imports, and pointing the client component there instead. No behavior
+  change; noted because it's a pattern worth watching for in later phases
+  (any client component consuming a "just a constant" export must check
+  what its module transitively pulls in).
+- **`"use server"` files may only export async functions.** `actions.ts`
+  originally also exported a plain object (`zohoInitialActionState`) used
+  to seed `useActionState`. Next.js forbids non-function exports from a
+  `"use server"` file — this only surfaced at the Playwright webServer's
+  production build step, not at `tsc`/ESLint. Fixed by extracting the
+  constant and its type into a plain (non-`"use server"`) module,
+  `app/zoho/action-state.ts`.
+- **Playwright can't load the generated Prisma client.** The generated
+  client uses `import.meta`, which Playwright's TS transform doesn't
+  support. `tests/e2e/zoho-integration.spec.ts` uses a raw `pg.Client` for
+  its fixture setup/teardown instead of importing `lib/db`. This is a test
+  infrastructure detail only — the app itself always uses the Prisma
+  client.
+- **OAuth scope requested is `ZohoInventory.fullaccess.all`.** This is the
+  broadest Inventory scope and is intentionally permissive for this phase
+  since the exact minimal set of read/write scopes actually needed
+  (read-only for most entities, since this app only reads master data and
+  transactions) wasn't specified. Flagging as a candidate to narrow once a
+  real Zoho app is registered and the exact API calls in use are reviewed
+  against Zoho's documented per-endpoint scope requirements.
+- **Exact Zoho Inventory API field names could not be verified against
+  live documentation** — this sandbox has no outbound access to
+  `zoho.com`. Mappers were written against well-established public Zoho
+  Inventory API conventions; fields with lower confidence (mainly
+  purchase-order/receipt line-level delivery/shipment dates) are marked
+  with `// VERIFY` comments and handled as optional with safe fallbacks
+  rather than assumed present. These should be confirmed against Zoho's
+  live API reference (or a real sandbox response) before the first real
+  sync, per §9 below.
+
+## 9. Zoho Integration Architecture (Phase 1 — implemented)
+
+This section documents the Zoho Inventory integration built in Phase 1:
+OAuth connection, the API client, and the sync jobs. No MRP logic,
+BOM management, or purchase recommendations are part of this phase — see
+§2 for phase scope.
+
+### 9.1 OAuth2 flow
+
+Standard OAuth2 authorization-code flow against Zoho Accounts:
+
+1. An ADMIN goes to `/zoho`, enters the Zoho Organization ID, and clicks
+   **Connect to Zoho**. The `connectZohoAction` Server Action builds an
+   authorization URL (`https://accounts.zoho.<dc>/oauth/v2/auth`) with a
+   signed, time-boxed CSRF `state` parameter (HMAC-SHA256 over a nonce,
+   using `AUTH_SECRET`) and redirects the browser to Zoho.
+2. The user approves access on Zoho's consent screen; Zoho redirects back
+   to `ZOHO_REDIRECT_URI` (this app's `/api/zoho/oauth/callback` Route
+   Handler) with a `code` and the echoed `state`.
+3. The callback route verifies the `state` signature/expiry, exchanges the
+   `code` for an access + refresh token pair
+   (`https://accounts.zoho.<dc>/oauth/v2/token`), encrypts both
+   (AES-256-GCM, `ZOHO_ENCRYPTION_KEY`) and upserts them into
+   `ZohoConnection` along with the organization ID and data center.
+4. Subsequent API calls use `getValidAccessToken()`, which decrypts the
+   stored access token, and transparently calls
+   `https://accounts.zoho.<dc>/oauth/v2/token` with `grant_type=refresh_token`
+   to mint a new access token when expired (or on a `401` from the API, as
+   a one-shot retry distinct from the client's normal retry budget).
+5. **Disconnect** (`disconnectZohoAction`, ADMIN-only) calls
+   `https://accounts.zoho.<dc>/oauth/v2/token/revoke` on the refresh token,
+   then deletes the `ZohoConnection` row regardless of whether the revoke
+   call itself succeeded (a connection is never left half-disconnected
+   because Zoho's revoke endpoint returned an error).
+
+The browser never receives the client secret, refresh token, or access
+token at any point — `toConnectionStatus()` maps `ZohoConnection` to a
+client-safe shape (connected/not-connected, organization ID, data center,
+last sync summary) with no token fields, and that is the only Zoho-related
+data sent to the client.
+
+### 9.2 Configuration (environment variables)
+
+| Variable              | Required for              | Notes                                                                                                                                  |
+| --------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `ZOHO_CLIENT_ID`      | connecting                | From the Zoho API Console app registration.                                                                                            |
+| `ZOHO_CLIENT_SECRET`  | connecting                | Server-side only; never logged, never sent to the browser.                                                                             |
+| `ZOHO_REDIRECT_URI`   | connecting                | Must exactly match the API Console app's registered redirect URI.                                                                      |
+| `ZOHO_DATA_CENTER`    | connecting                | One of `com`, `in`, `eu`, `au`, `jp`, `ca` — determines which `accounts.zoho.<dc>` / `www.zohoapis.<dc>` hosts are used.               |
+| `ZOHO_ENCRYPTION_KEY` | always (even pre-connect) | 32-byte base64 AES-256-GCM key for encrypting stored tokens; exercised by the test suite regardless of whether a real Zoho app exists. |
+
+Until the first four are set, `/zoho` shows a clear "Zoho OAuth is not
+configured yet" message rather than attempting (and failing) a real OAuth
+redirect — this was verified in both integration and e2e tests.
+
+Requested scope: `ZohoInventory.fullaccess.all` (see §8 deviations —
+candidate to narrow later).
+
+### 9.3 API client
+
+`lib/zoho/client/zohoApiClient.ts` is a pure HTTP client (no DB access)
+with:
+
+- **Retry/backoff**: exponential delay with jitter, bounded retry count,
+  honors a `Retry-After` header on `429`s, distinguishes retryable
+  (network/5xx/429) from non-retryable (4xx other than 401/429) failures
+  via the `ZohoApiError` hierarchy (`retryable` flag).
+- **401 handling**: one automatic access-token refresh + single retry of
+  the original request, separate from the general retry budget — a second
+  401 after refresh is not retried again and surfaces as an error.
+- **Timeouts**: every request is wrapped with an `AbortController`-based
+  timeout.
+- **Pagination**: `lib/zoho/client/pagination.ts` exposes an async
+  generator (`paginate()`) over Zoho's page-based list responses, plus a
+  single-page fetch helper (`fetchZohoListPage()`) sync jobs use directly
+  when they need to inspect `page_context` themselves.
+
+`lib/zoho/client/connectedClient.ts` wires the DB-backed connection
+(organization ID, data center, token refresh) into the pure client so
+callers never handle tokens directly.
+
+### 9.4 Entity mapping and sync
+
+| Zoho entity                 | Local model(s)                           | Sync module                | Notes                                                                                                                                                                                  |
+| --------------------------- | ---------------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Items                       | `Item`                                   | `sync/items.ts`            | Also source of per-warehouse stock (see Stock row).                                                                                                                                    |
+| Vendors                     | `Vendor`                                 | `sync/vendors.ts`          |                                                                                                                                                                                        |
+| Warehouses                  | `Warehouse`                              | `sync/warehouses.ts`       |                                                                                                                                                                                        |
+| Purchase Orders (+ lines)   | `PurchaseOrder`, `PurchaseOrderLine`     | `sync/purchaseOrders.ts`   | Two-tier fetch: list endpoint for IDs, detail endpoint per PO for line items. Computes `usableForMrp` (see below).                                                                     |
+| Purchase Receipts (+ lines) | `PurchaseReceipt`, `PurchaseReceiptLine` | `sync/purchaseReceipts.ts` | Same two-tier list+detail pattern as POs.                                                                                                                                              |
+| Sales Orders (+ lines)      | `SalesOrder`, `SalesOrderLine`           | `sync/salesOrders.ts`      | Same two-tier list+detail pattern.                                                                                                                                                     |
+| Stock                       | `StockSnapshot`                          | `sync/stock.ts`            | Reuses the Items detail endpoint (per-warehouse stock is embedded in Zoho's item response) rather than a separate stock-specific endpoint — a deliberate reuse, not a missing feature. |
+
+Every mapper (`lib/zoho/mappers/*.ts`) validates the raw Zoho JSON with a
+Zod schema before mapping it to a Prisma input shape — external data is
+never trusted blindly. `computeUsableForMrp()` in
+`mappers/purchaseOrder.ts` implements the business rule for which PO lines
+count as inbound supply for planning purposes (approved-status,
+non-cancelled, remaining-quantity-aware).
+
+**Idempotency and resumability**: every persist step is an upsert keyed on
+the stable Zoho ID (`zohoItemId`, `zohoVendorId`, etc.), so a sync run is
+always safe to re-run in full from page 1 — re-running never creates
+duplicates or double-applies a partial page. `SyncLog.lastPageCursor` is
+recorded for observability into how far a run progressed, but the
+implemented recovery strategy is "safe full re-run" rather than
+cursor-resume, since the schema doesn't need a resume-cursor contract to
+achieve safe recovery (see §8 for why this didn't require a schema
+change). The generic engine (`sync/engine.ts`) also strictly separates
+network I/O (fetch/validate/enrich) from DB transactions (persist), so a
+transaction is never left open across a slow network call.
+
+**Two-tier fetch pattern**: for POs/Receipts/Sales Orders, Zoho's list
+endpoint doesn't include line items, so each sync fetches the list, then
+fetches the detail endpoint per record for lines. This is a Zoho API
+constraint, not a design choice.
+
+### 9.5 Security model
+
+- Tokens are encrypted at rest (AES-256-GCM) in `ZohoConnection`; the
+  encryption key (`ZOHO_ENCRYPTION_KEY`) is a separate secret from
+  `AUTH_SECRET`.
+- The browser never receives the client secret, refresh token, or access
+  token — enforced by `toConnectionStatus()`'s explicit allow-list mapping
+  rather than by omission.
+- Every Server Action and Route Handler that touches the connection or
+  triggers a sync calls `requireRole()` as its first line: ADMIN-only for
+  connect/disconnect, ADMIN or PLANNER for triggering syncs, any
+  authenticated role for read-only status.
+- The structured logger (`lib/logging/index.ts`) redacts token-shaped
+  fields by key name; `SyncLog.errorDetails` additionally runs free-text
+  regex redaction, since error messages/stack traces can otherwise leak a
+  token value that isn't under a recognized key.
+- No real credentials exist anywhere in the repo — `.env.example` has
+  placeholders only, and `.env`/`.env.test` (gitignored) hold locally
+  generated encryption keys, never Zoho app credentials.
+
+### 9.6 Testing approach (no real Zoho credentials)
+
+No Zoho API console app is registered yet, so all testing uses mocked
+responses rather than a live connection:
+
+- **Unit tests** (`tests/unit/zoho/`) mock `fetch` (or inject a fake
+  `fetchImpl`) to test OAuth config/token exchange/refresh, encryption,
+  the API client's retry/backoff/rate-limit/timeout/401-refresh behavior,
+  pagination, and every entity mapper's Zod validation + mapping
+  (including `usableForMrp`).
+- **Integration tests** (`tests/integration/zoho/`) run the sync engine
+  and per-entity sync functions against a real Postgres test database with
+  an injected fake `ZohoApiClient` (no real HTTP), verifying idempotent
+  upserts, partial-failure handling, and `SyncLog` record creation
+  including secret redaction.
+- **E2E tests** (`tests/e2e/zoho-integration.spec.ts`) exercise `/zoho`
+  with no Zoho credentials configured at all, verifying the connection
+  status UI, RBAC-gated controls, and the "not configured" graceful
+  failure path — not a real OAuth round trip.
+
+### 9.7 Connecting to a real Zoho org (future, once credentials exist)
+
+See the README's "Connecting to Zoho" section for the operator steps.
+Before the first real connection, confirm the data center and organization
+ID with Dopar Energy's Zoho account owner, and re-verify the `// VERIFY`-
+flagged field names in the mappers (§8) against either Zoho's live API
+reference or a captured real response, since they were written without
+access to live documentation.
+
+## 10. What's explicitly out of scope (for now)
 
 Per repeated explicit instruction: no full MES, no routing/work-center
 capacity planning, no quality management, no maintenance management, no

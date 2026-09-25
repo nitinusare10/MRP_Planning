@@ -11,8 +11,14 @@ architecture, database schema, and the MRP calculation method. This repo is
 being built in controlled phases — see that document for what's implemented
 vs. planned.
 
-**Status: Phase 0 (project foundation) complete.** No Zoho integration, BOM
-explosion, or MRP engine yet — see "Current phase" in the architecture doc.
+**Status: Phase 0 (project foundation) and Phase 1 (Zoho Inventory
+integration foundation) complete.** The Zoho OAuth flow, API client, and
+sync jobs for Items/Vendors/Warehouses/Purchase Orders/Purchase
+Receipts/Sales Orders/Stock are fully built and tested against mocked Zoho
+responses — but no real Zoho app is registered yet, so "Connect to Zoho" is
+inert until `ZOHO_CLIENT_ID`/`ZOHO_CLIENT_SECRET`/`ZOHO_REDIRECT_URI`/
+`ZOHO_DATA_CENTER` are added. No Master Data UI, BOM, or MRP engine yet —
+see "Development phases" in the architecture doc.
 
 ## Prerequisites
 
@@ -63,8 +69,21 @@ seeded admin account.
   immutability/traceability, and purchase recommendation → requisition
   consolidation. Point `DATABASE_URL` in `.env.test` at a dedicated test
   database — these tests create and delete real rows.
-- **E2E tests** (`tests/e2e`, Playwright) cover the auth/RBAC flow end to
-  end: unauthenticated redirect, invalid credentials, login, and sign-out.
+- **E2E tests** (`tests/e2e`, Playwright) cover the auth/RBAC flow (login,
+  invalid credentials, sign-out) and the Zoho integration page (connection
+  status, role-gated connect/sync controls, graceful "not configured"
+  handling).
+- **Zoho tests** (`tests/unit/zoho`, `tests/integration/zoho`) cover OAuth
+  config/token exchange/refresh, AES-256-GCM token encryption, the API
+  client's retry/backoff/rate-limit/timeout handling, pagination, every
+  entity mapper (including the `usableForMrp` rule), idempotent/resumable
+  sync against real Postgres with a fake injected Zoho client, and secret
+  redaction in `SyncLog`.
+
+Playwright's own TS transform can't load the generated Prisma client (it
+uses `import.meta`); e2e tests that need direct DB fixtures talk to Postgres
+via `pg` instead of importing `@/lib/db` — see
+`tests/e2e/zoho-integration.spec.ts`.
 
 ## Project structure
 
@@ -72,20 +91,26 @@ seeded admin account.
 prisma/            schema.prisma, migrations, seed.ts
 src/
   app/              Next.js App Router pages, API routes
+    zoho/           Zoho integration status page + Server Actions
+    api/zoho/oauth/callback/   OAuth callback Route Handler
   components/       ui / tables / forms / layout (built out from Phase 2 on)
   lib/
     auth/           password hashing, server-side RBAC
     db/             Prisma client singleton
     errors/         typed AppError hierarchy + API error mapping
     logging/        structured logger (pino)
-    mrp/            MRP engine (Phase 5 — empty for now)
+    mrp/            MRP engine (Phase 6 — empty for now)
     validation/     Zod schemas
-    zoho/           Zoho Inventory integration (Phase 2 — empty for now)
+    zoho/           Zoho Inventory integration (Phase 1 — built)
+      auth/         OAuth flow, encrypted token storage, connection mgmt
+      client/       API client: retry/backoff/rate-limit/timeout, pagination
+      mappers/      per-entity Zod validation + Zoho -> Prisma mapping
+      sync/         generic sync engine + one module per entity
   services/         business logic layer, one module per domain
   types/            ambient type augmentations
   auth.ts / auth.config.ts / proxy.ts   Auth.js configuration (see file comments — split for Edge-runtime compatibility)
 tests/
-  unit/  integration/  e2e/
+  unit/zoho/  integration/zoho/  e2e/
 docs/
   architecture.md   approved system architecture & database schema
   decisions/        architecture decision records
@@ -95,7 +120,22 @@ docs/
 
 - Never commit `.env` or any real Zoho/OAuth credentials — only
   `.env.example` (with placeholders) is tracked.
-- Zoho tokens (once Phase 2 is built) are encrypted at rest and are never
-  sent to the browser; all Zoho API calls happen server-side only.
-- Authorization is enforced server-side (`lib/auth/rbac.ts`), not just
+- Zoho tokens are encrypted at rest (AES-256-GCM, `ZOHO_ENCRYPTION_KEY`) and
+  are never sent to the browser; all Zoho API calls happen server-side only.
+- Authorization is enforced server-side (`lib/auth/rbac.ts` /
+  `requireRole()` inside every Server Action and Route Handler), not just
   hidden in the UI.
+- The structured logger and `SyncLog.errorDetails` both redact token-shaped
+  values — see `lib/zoho/redact.ts` and `lib/logging/index.ts`.
+
+## Connecting to Zoho (once you have API credentials)
+
+1. Register an app at the Zoho API Console for your data center
+   (`api-console.zoho.com` / `.in` / etc.) with redirect URI
+   `<your-deployment-url>/api/zoho/oauth/callback`.
+2. Set `ZOHO_CLIENT_ID`, `ZOHO_CLIENT_SECRET`, `ZOHO_REDIRECT_URI`,
+   `ZOHO_DATA_CENTER` in `.env` (see `.env.example`).
+3. Sign in as an ADMIN, go to `/zoho`, enter the Zoho Organization ID, and
+   click **Connect to Zoho**.
+4. Once connected, ADMIN/PLANNER users can trigger a sync per entity or all
+   at once from the same page.
