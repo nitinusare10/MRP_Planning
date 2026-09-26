@@ -584,13 +584,15 @@ details encountered while building it:
   its fixture setup/teardown instead of importing `lib/db`. This is a test
   infrastructure detail only — the app itself always uses the Prisma
   client.
-- **OAuth scope requested is `ZohoInventory.fullaccess.all`.** This is the
-  broadest Inventory scope and is intentionally permissive for this phase
-  since the exact minimal set of read/write scopes actually needed
-  (read-only for most entities, since this app only reads master data and
-  transactions) wasn't specified. Flagging as a candidate to narrow once a
-  real Zoho app is registered and the exact API calls in use are reviewed
-  against Zoho's documented per-endpoint scope requirements.
+- **OAuth scope narrowed from `ZohoInventory.fullaccess.all` to six explicit
+  READ-only scopes** (`lib/zoho/types.ts`,
+  `ZOHO_INVENTORY_OAUTH_SCOPES`) before the real Zoho app was registered:
+  `items.READ`, `contacts.READ`, `warehouses.READ`, `purchaseorders.READ`,
+  `purchasereceives.READ`, `salesorders.READ`. Each was verified against the
+  official Zoho Inventory API docs and matched 1:1 against the endpoint
+  every sync module actually calls (`GET /items`, `GET /contacts`, etc. —
+  no sync module issues a POST/PUT/DELETE). No `ZohoInventory.organizations.*`
+  scope is requested since no sync module calls `/organizations`. See §9.2.
 - **Exact Zoho Inventory API field names could not be verified against
   live documentation** — this sandbox has no outbound access to
   `zoho.com`. Mappers were written against well-established public Zoho
@@ -656,8 +658,23 @@ Until the first four are set, `/zoho` shows a clear "Zoho OAuth is not
 configured yet" message rather than attempting (and failing) a real OAuth
 redirect — this was verified in both integration and e2e tests.
 
-Requested scope: `ZohoInventory.fullaccess.all` (see §8 deviations —
-candidate to narrow later).
+Requested scopes (least-privilege, READ-only; centralized in
+`lib/zoho/types.ts` as `ZOHO_INVENTORY_OAUTH_SCOPES`, see §8):
+
+| Scope                                 | Zoho module       | Backs                                                                                             |
+| ------------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------- |
+| `ZohoInventory.items.READ`            | Items             | Items sync, and Stock (reuses the item detail endpoint's per-warehouse `stock_on_hand`)           |
+| `ZohoInventory.contacts.READ`         | Contacts          | Vendors sync (`GET /contacts?contact_type=vendor` — Zoho Inventory has no separate vendors scope) |
+| `ZohoInventory.warehouses.READ`       | Warehouses        | Warehouses sync                                                                                   |
+| `ZohoInventory.purchaseorders.READ`   | Purchase Orders   | Purchase Orders sync (list + per-PO detail)                                                       |
+| `ZohoInventory.purchasereceives.READ` | Purchase Receives | Purchase Receipts sync (list + per-receipt detail)                                                |
+| `ZohoInventory.salesorders.READ`      | Sales Orders      | Sales Orders sync (list + per-order detail)                                                       |
+
+No CREATE/UPDATE/DELETE/ALL scope and no `ZohoInventory.fullaccess.all` are
+requested — every sync module issues GET requests only. No
+`ZohoInventory.organizations.*` scope is requested either, since no sync
+module calls `/organizations` (the Organization ID is entered manually by
+the connecting ADMIN).
 
 ### 9.3 API client
 

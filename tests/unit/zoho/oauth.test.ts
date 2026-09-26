@@ -13,6 +13,7 @@ import {
   ZohoMalformedResponseError,
   ZohoNetworkError,
 } from "@/lib/zoho/errors";
+import { ZOHO_INVENTORY_OAUTH_SCOPES } from "@/lib/zoho/types";
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -69,6 +70,65 @@ describe("buildAuthorizationUrl", () => {
     expect(url).toContain("state=nonce-value");
     expect(url).toContain("access_type=offline");
     expect(url).not.toContain("super-secret");
+  });
+
+  it("requests exactly the approved least-privilege READ-only scope set — no more, no less", () => {
+    const url = buildAuthorizationUrl(
+      {
+        clientId: "abc123",
+        clientSecret: "super-secret",
+        redirectUri: "https://app.example.com/cb",
+        dataCenter: "in",
+      },
+      "nonce-value",
+    );
+    const requestedScope = new URL(url).searchParams.get("scope");
+    expect(requestedScope).not.toBeNull();
+    const requestedScopes = requestedScope!.split(",");
+
+    expect(requestedScopes).toEqual([...ZOHO_INVENTORY_OAUTH_SCOPES]);
+    expect(requestedScopes).toHaveLength(6);
+  });
+
+  it("never requests fullaccess or any CREATE/UPDATE/DELETE scope (Phase 1 is read-only)", () => {
+    const url = buildAuthorizationUrl(
+      {
+        clientId: "abc123",
+        clientSecret: "super-secret",
+        redirectUri: "https://app.example.com/cb",
+        dataCenter: "in",
+      },
+      "nonce-value",
+    );
+    const requestedScope = new URL(url).searchParams.get("scope")!;
+
+    expect(requestedScope).not.toMatch(/fullaccess/i);
+    expect(requestedScope).not.toMatch(/\.(CREATE|UPDATE|DELETE|ALL)\b/);
+    for (const scope of requestedScope.split(",")) {
+      expect(scope).toMatch(/^ZohoInventory\.[a-z]+\.READ$/);
+    }
+  });
+
+  it("requests read access to every Phase 1 entity's backing Zoho module", () => {
+    const url = buildAuthorizationUrl(
+      {
+        clientId: "abc123",
+        clientSecret: "super-secret",
+        redirectUri: "https://app.example.com/cb",
+        dataCenter: "in",
+      },
+      "nonce-value",
+    );
+    const requestedScopes = new URL(url).searchParams.get("scope")!.split(",");
+
+    // Items (and Stock, which reuses the Items endpoint)
+    expect(requestedScopes).toContain("ZohoInventory.items.READ");
+    // Vendors (Contacts, filtered by contact_type=vendor)
+    expect(requestedScopes).toContain("ZohoInventory.contacts.READ");
+    expect(requestedScopes).toContain("ZohoInventory.warehouses.READ");
+    expect(requestedScopes).toContain("ZohoInventory.purchaseorders.READ");
+    expect(requestedScopes).toContain("ZohoInventory.purchasereceives.READ");
+    expect(requestedScopes).toContain("ZohoInventory.salesorders.READ");
   });
 });
 
